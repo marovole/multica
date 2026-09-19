@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func importURLParams(req *http.Request, targetID string) *http.Request {
@@ -231,6 +232,83 @@ func TestImportFromWorkspace_SkipNameConflict(t *testing.T) {
 	}
 	if len(result.Agents) != 1 || result.Agents[0].Status != "skipped" || result.Agents[0].ID != existing {
 		t.Fatalf("want skipped reuse of %s, got %+v", existing, result.Agents)
+	}
+}
+
+func TestImportFromWorkspace_SkipDoesNotWireUnwitablePrivateAgent(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	sourceID, sourceAgentID, _, _ := setupImportSource(t)
+	var sourceName string
+	if err := testPool.QueryRow(ctx, `SELECT name FROM agent WHERE id = $1`, sourceAgentID).Scan(&sourceName); err != nil {
+		t.Fatalf("source name: %v", err)
+	}
+
+	memberID := createPlainMember(t, "import-wire-"+uuid.NewString()[:8]+"@multica.test")
+	dbfx.Member(t, sourceID, memberID, "member")
+
+	privateID := dbfx.Agent(t, sourceName, handlerTestRuntimeID(t), testutil.Cols{
+		"visibility":      "private",
+		"permission_mode": "private",
+		"owner_id":        testUserID,
+	})
+	publicRT := dbfx.Runtime(t, "import-public-rt-"+uuid.NewString()[:8], testutil.Cols{
+		"workspace_id": testWorkspaceID,
+		"visibility":   "public",
+	})
+
+	memberRow, err := testHandler.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+		UserID:      parseUUID(memberID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load member: %v", err)
+	}
+	privateAgent, err := testHandler.Queries.GetAgent(ctx, parseUUID(privateID))
+	if err != nil {
+		t.Fatalf("load private agent: %v", err)
+	}
+	if testHandler.memberCanWireAgent(ctx, memberRow, privateAgent, testWorkspaceID) {
+		t.Fatal("fixture broken: memberCanWireAgent must be false for the others' private agent")
+	}
+
+	w := httptest.NewRecorder()
+	req := importURLParams(newRequestAs(memberID, http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/import-from-workspace", map[string]any{
+		"source_workspace_id": sourceID,
+		"runtime_id":          publicRT,
+		"import_all":          true,
+	}), testWorkspaceID)
+	testHandler.ImportFromWorkspace(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("import: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var result WorkspaceImportResponse
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(result.Agents) != 1 || result.Agents[0].Status != "skipped" {
+		t.Fatalf("want skipped agent, got %+v", result.Agents)
+	}
+	for _, squad := range result.Squads {
+		if squad.Status == "created" {
+			t.Fatalf("must not create a squad wired through an unwitable agent: %+v", result.Squads)
+		}
+	}
+	var wired int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM squad_member WHERE member_type = 'agent' AND member_id = $1`, privateID).Scan(&wired); err != nil {
+		t.Fatalf("count wired: %v", err)
+	}
+	if wired != 0 {
+		t.Fatalf("private agent wired into %d squad(s)", wired)
+	}
+	var led int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM squad WHERE workspace_id = $1 AND leader_id = $2`, testWorkspaceID, privateID).Scan(&led); err != nil {
+		t.Fatalf("count led: %v", err)
+	}
+	if led != 0 {
+		t.Fatalf("private agent became leader of %d squad(s)", led)
 	}
 }
 

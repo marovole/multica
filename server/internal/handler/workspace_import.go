@@ -205,14 +205,15 @@ func (h *Handler) ImportFromWorkspace(w http.ResponseWriter, r *http.Request) {
 	qtx := h.Queries.WithTx(tx)
 
 	result, err := h.runWorkspaceImport(r.Context(), qtx, workspaceImportPlan{
-		targetID:   targetID,
-		targetUUID: targetUUID,
-		sourceID:   req.SourceWorkspaceID,
-		userID:     userID,
-		runtime:    runtime,
-		onConflict: req.OnConflict,
-		agentIDs:   agentIDs,
-		squadIDs:   squadIDs,
+		targetID:     targetID,
+		targetUUID:   targetUUID,
+		sourceID:     req.SourceWorkspaceID,
+		userID:       userID,
+		targetMember: targetMember,
+		runtime:      runtime,
+		onConflict:   req.OnConflict,
+		agentIDs:     agentIDs,
+		squadIDs:     squadIDs,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -429,14 +430,15 @@ func selectImportIDs(w http.ResponseWriter, req workspaceImportRequest, agents [
 }
 
 type workspaceImportPlan struct {
-	targetID   string
-	targetUUID pgtype.UUID
-	sourceID   string
-	userID     string
-	runtime    db.AgentRuntime
-	onConflict string
-	agentIDs   []string
-	squadIDs   []string
+	targetID     string
+	targetUUID   pgtype.UUID
+	sourceID     string
+	userID       string
+	targetMember db.Member
+	runtime      db.AgentRuntime
+	onConflict   string
+	agentIDs     []string
+	squadIDs     []string
 }
 
 func (h *Handler) runWorkspaceImport(ctx context.Context, q *db.Queries, plan workspaceImportPlan) (WorkspaceImportResponse, error) {
@@ -504,7 +506,14 @@ func (h *Handler) copyImportedAgent(ctx context.Context, q *db.Queries, plan wor
 	sourceID := uuidToString(src.ID)
 	name, reusedID, skip := allocateImportedName(names, src.Name, plan.onConflict)
 	if skip {
-		idMap[sourceID] = reusedID
+		// Name collision: do not create a second agent. Only reuse the
+		// existing row for squad wiring when the importer could attach it
+		// through CreateSquad / AddSquadMember (MUL-4223). Putting an
+		// unwitable private agent in idMap would let a member smuggle it
+		// in as squad leader by matching its name.
+		if h.canWireImportedAgent(ctx, q, plan, reusedID) {
+			idMap[sourceID] = reusedID
+		}
 		return workspaceImportItemResult{SourceID: sourceID, ID: reusedID, Name: src.Name, Status: "skipped"}, nil
 	}
 
@@ -600,7 +609,7 @@ func (h *Handler) copyImportedAgent(ctx context.Context, q *db.Queries, plan wor
 func (h *Handler) copyImportedSquad(ctx context.Context, q *db.Queries, plan workspaceImportPlan, src db.Squad, names map[string]importNameEntry, idMap map[string]string) (workspaceImportItemResult, error) {
 	sourceID := uuidToString(src.ID)
 	leaderID, ok := idMap[uuidToString(src.LeaderID)]
-	if !ok {
+	if !ok || !h.canWireImportedAgent(ctx, q, plan, leaderID) {
 		return workspaceImportItemResult{SourceID: sourceID, Name: src.Name, Status: "skipped"}, nil
 	}
 	name, reusedID, skip := allocateImportedName(names, src.Name, plan.onConflict)
@@ -633,7 +642,7 @@ func (h *Handler) copyImportedSquad(ctx context.Context, q *db.Queries, plan wor
 		switch m.MemberType {
 		case "agent":
 			mapped, ok := idMap[uuidToString(m.MemberID)]
-			if !ok || mapped == leaderID {
+			if !ok || mapped == leaderID || !h.canWireImportedAgent(ctx, q, plan, mapped) {
 				continue
 			}
 			if _, err := q.AddSquadMember(ctx, db.AddSquadMemberParams{
@@ -688,6 +697,20 @@ func allocateImportedName(existing map[string]importNameEntry, name, onConflict 
 			return candidate, "", false
 		}
 	}
+}
+
+func (h *Handler) canWireImportedAgent(ctx context.Context, q *db.Queries, plan workspaceImportPlan, agentID string) bool {
+	if agentID == "" {
+		return false
+	}
+	agent, err := q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		ID:          parseUUID(agentID),
+		WorkspaceID: plan.targetUUID,
+	})
+	if err != nil {
+		return false
+	}
+	return h.memberCanWireAgent(ctx, plan.targetMember, agent, plan.targetID)
 }
 
 func remapCreatedAgentMentions(ctx context.Context, q *db.Queries, items []workspaceImportItemResult, idMap map[string]string) error {
