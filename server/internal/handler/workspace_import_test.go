@@ -380,6 +380,10 @@ func TestRewriteImportedMentions(t *testing.T) {
 	if rewriteImportedMentions("", map[string]string{"a": "b"}) != "" {
 		t.Fatal("empty text should stay empty")
 	}
+	self := rewriteImportedMentions("mention://agent/src-id", map[string]string{"src-id": "dst-id"})
+	if self != "mention://agent/dst-id" {
+		t.Fatalf("self mention = %q", self)
+	}
 }
 
 func TestSelectImportIDs_RejectsUnknownAgent(t *testing.T) {

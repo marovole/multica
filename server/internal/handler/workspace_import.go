@@ -477,6 +477,9 @@ func (h *Handler) runWorkspaceImport(ctx context.Context, q *db.Queries, plan wo
 		}
 		out.Agents = append(out.Agents, item)
 	}
+	if err := remapCreatedAgentMentions(ctx, q, out.Agents, idMap); err != nil {
+		return WorkspaceImportResponse{}, err
+	}
 
 	for _, sourceID := range plan.squadIDs {
 		src, err := q.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
@@ -547,7 +550,7 @@ func (h *Handler) copyImportedAgent(ctx context.Context, q *db.Queries, plan wor
 		WorkspaceID:          plan.targetUUID,
 		Name:                 name,
 		Description:          src.Description,
-		Instructions:         rewriteImportedMentions(src.Instructions, idMap),
+		Instructions:         src.Instructions,
 		AvatarUrl:            src.AvatarUrl,
 		RuntimeMode:          plan.runtime.RuntimeMode,
 		RuntimeConfig:        []byte("{}"),
@@ -685,6 +688,43 @@ func allocateImportedName(existing map[string]importNameEntry, name, onConflict 
 			return candidate, "", false
 		}
 	}
+}
+
+func remapCreatedAgentMentions(ctx context.Context, q *db.Queries, items []workspaceImportItemResult, idMap map[string]string) error {
+	if len(idMap) == 0 {
+		return nil
+	}
+	for _, item := range items {
+		if item.Status != "created" || item.ID == "" {
+			continue
+		}
+		created, err := q.GetAgent(ctx, parseUUID(item.ID))
+		if err != nil {
+			return fmt.Errorf("failed to load imported agent for mention remap")
+		}
+		instructions := rewriteImportedMentions(created.Instructions, idMap)
+		starters := created.ConversationStarters
+		if len(starters) > 0 {
+			rewritten := rewriteImportedMentions(string(starters), idMap)
+			if rewritten != string(starters) {
+				starters = []byte(rewritten)
+			}
+		}
+		if instructions == created.Instructions && string(starters) == string(created.ConversationStarters) {
+			continue
+		}
+		params := db.UpdateAgentParams{ID: created.ID}
+		if instructions != created.Instructions {
+			params.Instructions = pgtype.Text{String: instructions, Valid: true}
+		}
+		if string(starters) != string(created.ConversationStarters) {
+			params.ConversationStarters = starters
+		}
+		if _, err := q.UpdateAgent(ctx, params); err != nil {
+			return fmt.Errorf("failed to remap agent mentions")
+		}
+	}
+	return nil
 }
 
 func rewriteImportedMentions(text string, idMap map[string]string) string {
